@@ -48,6 +48,7 @@ import {
   appendBrowsePathSegment,
   inferProjectTitleFromPath,
   isWindowsPlatform,
+  trackedFoldersFromSelection,
 } from "@t3tools/client-runtime/state/projects";
 import { resolvePastedPath } from "@t3tools/shared/path";
 import {
@@ -58,8 +59,10 @@ import {
   type EnvironmentId,
   type EnvironmentMachineKind,
   ProjectId,
+  type ProjectTrackedFolder,
   resolveEnvironmentMachineKind,
   SourceControlProviderKind,
+  type WorkspaceScannedFolder,
 } from "@t3tools/contracts";
 import {
   StackActions,
@@ -86,6 +89,7 @@ import { sourceControlEnvironment } from "../../state/sourceControl";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/ui/AppText";
 import { EnvironmentMachineSymbol } from "../../components/EnvironmentMachineSymbol";
 import { ErrorBanner } from "../../components/ui/ErrorBanner";
+import { ScannedFolderRows, scannedFolderCountLabel } from "./ScannedFolderRows";
 import { SourceControlIcon } from "./SourceControlIcon";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { ThemedSwitch } from "../../components/ui/ThemedSwitch";
@@ -733,13 +737,26 @@ async function draftWithPrompt(
 function useCreateProject(environment: EnvironmentOption | null) {
   const openNewTaskDraft = useOpenNewTaskDraft();
   const navigation = useNavigation();
-  const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
+  const sendCreateProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const updateProject = useAtomCommand(projectEnvironment.update, {
     label: "project unarchive",
   });
   const projects = useProjects();
 
-  return async (workspaceRoot: string, originRoute = getActiveRoute(navigation)) => {
+  const findExisting = (workspaceRoot: string) =>
+    environment
+      ? findExistingAddProject({
+          projects,
+          environmentId: environment.environmentId,
+          path: workspaceRoot,
+        })
+      : null;
+
+  const createProject = async (
+    workspaceRoot: string,
+    trackedFolders: ReadonlyArray<ProjectTrackedFolder> = [],
+    originRoute = getActiveRoute(navigation),
+  ) => {
     if (
       !environment ||
       !canCreateProjectInEnvironment(environment.connectionState) ||
@@ -752,11 +769,7 @@ function useCreateProject(environment: EnvironmentOption | null) {
       return;
     }
 
-    const existing = findExistingAddProject({
-      projects,
-      environmentId: environment.environmentId,
-      path: workspaceRoot,
-    });
+    const existing = findExisting(workspaceRoot);
     if (existing) {
       // Adding an archived project's folder again brings the project back.
       const unarchived =
@@ -787,8 +800,9 @@ function useCreateProject(environment: EnvironmentOption | null) {
       commandId: CommandId.make(uuidv4()),
       projectId,
       workspaceRoot,
+      trackedFolders,
     });
-    const result = await createProject({
+    const result = await sendCreateProject({
       environmentId: environment.environmentId,
       input: command,
     });
@@ -818,6 +832,8 @@ function useCreateProject(environment: EnvironmentOption | null) {
     );
     return result;
   };
+
+  return { createProject, findExisting };
 }
 
 function useEnvironmentFromParam(
@@ -1313,11 +1329,34 @@ export function AddProjectLocalFolderScreen(props: { readonly environmentId?: st
     environment?.environmentId ?? null,
     AuthOrchestrationOperateScope,
   );
-  const createProject = useCreateProject(environment);
+  const { createProject, findExisting } = useCreateProject(environment);
+  const scanFolders = useAtomQueryRunner(filesystemEnvironment.scanFolders, {
+    reportFailure: false,
+    reportDefect: false,
+    refresh: true,
+  });
   const { isBrowseNavigating, navigateToBrowsePath, pathInput, setPathInput } =
     useBrowsePathInput(environment);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [found, setFound] = useState<{
+    readonly workspaceRoot: string;
+    readonly folders: ReadonlyArray<WorkspaceScannedFolder>;
+  } | null>(null);
+  const [deselectedPaths, setDeselectedPaths] = useState<ReadonlySet<string>>(new Set());
+
+  const addProject = async (
+    workspaceRoot: string,
+    trackedFolders: ReadonlyArray<ProjectTrackedFolder>,
+  ) => {
+    setError(null);
+    setIsSubmitting(true);
+    const result = await createProject(workspaceRoot, trackedFolders);
+    if (result && AsyncResult.isFailure(result)) {
+      setError(errorMessage(Cause.squash(result.cause)));
+    }
+    setIsSubmitting(false);
+  };
 
   const submitPath = async () => {
     if (!environment || isBrowseNavigating || isSubmitting) return;
@@ -1332,13 +1371,70 @@ export function AddProjectLocalFolderScreen(props: { readonly environmentId?: st
       return;
     }
 
-    setIsSubmitting(true);
-    const result = await createProject(resolved.path);
-    if (result && AsyncResult.isFailure(result)) {
-      setError(errorMessage(Cause.squash(result.cause)));
+    if (!findExisting(resolved.path)) {
+      setIsSubmitting(true);
+      // A scan that fails, or an environment too old to scan, adds the folder alone.
+      const scan = await scanFolders({
+        environmentId: environment.environmentId,
+        input: { workspaceRoot: resolved.path },
+      });
+      if (AsyncResult.isSuccess(scan) && scan.value.folders.length > 0) {
+        setDeselectedPaths(new Set());
+        setFound({ workspaceRoot: resolved.path, folders: scan.value.folders });
+        setIsSubmitting(false);
+        return;
+      }
     }
-    setIsSubmitting(false);
+    await addProject(resolved.path, []);
   };
+
+  if (environment && found) {
+    const selected = trackedFoldersFromSelection(found.folders, deselectedPaths);
+    const selectedFolders = found.folders.filter((folder) => !deselectedPaths.has(folder.path));
+    return (
+      <AddProjectShell title="Local folder">
+        {error ? <ErrorBanner message={error} /> : null}
+        <Text className="px-1 text-sm leading-snug text-foreground-muted">
+          {`Found ${scannedFolderCountLabel(found.folders)} in ${found.workspaceRoot}. Agents in this project can work in the ones you keep selected.`}
+        </Text>
+        <PrimaryActionButton
+          label={
+            selected.length > 0
+              ? `Add with ${scannedFolderCountLabel(selectedFolders)}`
+              : "Add with repositories"
+          }
+          disabled={!canCreateProject || isSubmitting || selected.length === 0}
+          onPress={() => void addProject(found.workspaceRoot, selected)}
+          loading={isSubmitting}
+        />
+        <Button
+          label="Add without repositories"
+          tone="secondary"
+          fullWidth
+          disabled={!canCreateProject || isSubmitting}
+          onPress={() => void addProject(found.workspaceRoot, [])}
+        />
+        <Button
+          label="Choose another folder"
+          tone="text"
+          fullWidth
+          disabled={isSubmitting}
+          onPress={() => {
+            setError(null);
+            setFound(null);
+          }}
+        />
+        <ListSection>
+          <ScannedFolderRows
+            folders={found.folders}
+            deselectedPaths={deselectedPaths}
+            disabled={isSubmitting}
+            onDeselectedPathsChange={setDeselectedPaths}
+          />
+        </ListSection>
+      </AddProjectShell>
+    );
+  }
 
   return (
     <AddProjectShell title="Local folder">

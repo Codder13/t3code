@@ -17,6 +17,8 @@ const state = vi.hoisted(() => ({
   scopes: new Set<string>(),
   baseDirectory: "",
   projects: [] as string[],
+  trackedFolders: [] as unknown[],
+  scanResult: null as unknown,
   existingProjects: [] as {
     environmentId: string;
     id: string;
@@ -134,7 +136,10 @@ vi.mock("../../state/use-remote-environment-registry", () => ({
   }),
 }));
 vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: (command: unknown) => command }));
-vi.mock("../../state/use-atom-query-runner", () => ({ useAtomQueryRunner: () => () => {} }));
+vi.mock("../../state/use-atom-query-runner", () => ({
+  useAtomQueryRunner: () => async () =>
+    state.scanResult ?? AsyncResult.failure(Cause.fail(new Error("Scan failed"))),
+}));
 vi.mock("../../state/query", () => ({ useEnvironmentQuery: () => ({ data: null }) }));
 vi.mock("../../state/presentation", () => ({
   useEnvironmentPresentation: () => ({ isReady: true, presentation: null }),
@@ -153,13 +158,14 @@ vi.mock("../../state/sourceControl", () => ({
 vi.mock("../../state/projects", () => ({
   projectEnvironment: {
     createNew: () => state.createNewResult,
-    create: ({ input }: { input: { workspaceRoot: string } }) => {
+    create: ({ input }: { input: { workspaceRoot: string; trackedFolders?: unknown } }) => {
       if (!state.scopes.has(AuthOrchestrationOperateScope)) {
         return Promise.resolve(
           AsyncResult.failure(Cause.fail(new Error("Project creation denied"))),
         );
       }
       state.projects.push(input.workspaceRoot);
+      state.trackedFolders.push(input.trackedFolders);
       return state.createResult ?? Promise.resolve(AsyncResult.success(undefined));
     },
   },
@@ -493,6 +499,8 @@ describe("local project navigation", () => {
     state.scopes = new Set([AuthOrchestrationOperateScope]);
     state.baseDirectory = "/tmp/t3-mobile-audit-fixture";
     state.projects = [];
+    state.trackedFolders = [];
+    state.scanResult = null;
     state.dispatch.mockReset();
     state.alert.mockReset();
     state.waitForProject.mockReset();
@@ -521,6 +529,45 @@ describe("local project navigation", () => {
       "Project added",
       "The project was created but has not reached this device yet. It will appear in the project list once the connection catches up.",
     );
+  });
+
+  it("offers the repositories a scan finds before adding the project", async () => {
+    const { created, projected } = setup();
+    state.scanResult = AsyncResult.success({
+      workspaceRoot: "/tmp/t3-mobile-audit-fixture",
+      isGitRepository: false,
+      codeWorkspaceFile: null,
+      folders: ["api", "web"].map((name) => ({
+        path: `/tmp/t3-mobile-audit-fixture/${name}`,
+        name,
+        isGitRepository: true,
+        source: "child",
+      })),
+    });
+    created.resolve(AsyncResult.success(undefined));
+    projected.resolve(null);
+    const root = createRoot(document.createElement("div"));
+    mountedRoots.push(root);
+    let screen: ReactNode;
+    function Observer() {
+      screen = AddProjectLocalFolderScreen({ environmentId: "environment" });
+      return null;
+    }
+    await act(() => root.render(createElement(Observer)));
+    await act(() => findAction(screen, "Add project")?.());
+
+    state.scanResult = null;
+
+    expect(state.projects).toEqual([]);
+    await act(() => findAction(screen, "Add with 2 repositories")?.());
+
+    expect(state.projects).toEqual(["/tmp/t3-mobile-audit-fixture"]);
+    expect(state.trackedFolders).toEqual([
+      [
+        { path: "/tmp/t3-mobile-audit-fixture/api", name: "api" },
+        { path: "/tmp/t3-mobile-audit-fixture/web", name: "web" },
+      ],
+    ]);
   });
 
   it("does not replace a reopened flow when the previous submission finishes", async () => {
